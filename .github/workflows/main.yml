@@ -1,0 +1,28 @@
+name: Build Wii MTP Homebrew
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fix Git Permissions
+        run: chown -R root:root $GITHUB_WORKSPACE
+
+      - name: Compile Application
+        run: |
+          make clean
+          make
+
+      - name: Upload Wii Homebrew Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wii-mtp-binaries
+          path: |
+            *.dol
+            *.elf

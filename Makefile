@@ -23,10 +23,13 @@ LIBS     := -lfat -lwiiuse -lbte -logc -lm
 CFILES   := $(foreach dir,$(SOURCES),$(wildcard $(dir)/*.c))
 OBJS     := $(CFILES:.c=.o)
 
+# Define explicit path to the elf2dol conversion tool utility
+ELF2DOL_TOOL := $(DEVKITPRO)/tools/bin/elf2dol
+
 all: $(TARGET).dol
 
 $(TARGET).dol: $(TARGET).elf
-	$(ELF2DOL) $< $@
+	$(ELF2DOL_TOOL) $< $@
 
 $(TARGET).elf: $(OBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@

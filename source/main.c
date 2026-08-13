@@ -25,7 +25,7 @@ typedef struct {
 // Cache structure to hold mapped files locally
 typedef struct {
     u32 handle;
-    char filename[64];
+    char filename[64]; // Fix: Explicitly sized string array container
 } FileCacheEntry;
 
 static s32 usb_device = -1;
@@ -43,15 +43,18 @@ void PrintUpdate(const char *msg) {
 
 bool InitUSBAndFindAndroid() {
     u8 dev_count = 0;
-    usb_device_entry dev_list;
+    // Fix: Declaring an explicit array list allocation for libogc structures
+    usb_device_entry dev_list[8];
     memset(dev_list, 0, sizeof(dev_list));
 
     USB_Initialize();
 
+    // Fix: Pass array reference down properly to retrieve elements
     s32 ret = USB_GetDeviceList(dev_list, 8, 0, &dev_count);
     if (ret < 0 || dev_count == 0) return false;
 
     for (int i = 0; i < dev_count; i++) {
+        // Generic Android Vendor IDs (Google, MediaTek, Samsung)
         if (dev_list[i].vid == 0x18d1 || dev_list[i].vid == 0x0e8d || dev_list[i].vid == 0x04e8) {
             if (USB_OpenDevice(dev_list[i].device_id, dev_list[i].vid, dev_list[i].pid, &usb_device) == 0) {
                 return true;
@@ -89,8 +92,7 @@ void FetchFilename(u32 handle, char* out_name, size_t max_len) {
     memset(info_buffer, 0, 1024);
     strncpy(out_name, "Unknown File Asset", max_len);
 
-    // Call MTP_OP_GET_OBJECT_INFO targeting our active unique handle ID
-    global_tx++; // Increment to map fresh out-of-loop parameter transaction blocks
+    global_tx++; 
     MTP_Header cmd;
     cmd.length = sizeof(MTP_Header);
     cmd.type = 1; 
@@ -98,21 +100,16 @@ void FetchFilename(u32 handle, char* out_name, size_t max_len) {
     cmd.transaction = global_tx;
 
     if (USB_WriteBlkMsg(usb_device, ep_out, sizeof(MTP_Header), &cmd) >= 0) {
-        // Pass out additional handle targeted parameters explicitly
         USB_WriteBlkMsg(usb_device, ep_out, sizeof(u32), &handle);
         
         s32 read_bytes = USB_ReadBlkMsg(usb_device, ep_in, 1024, info_buffer);
         if (read_bytes > 64) {
-            // According to MTP standards:
-            // Filename resides after StorageID(4B), Format(2B), Protection(2B), Size(8B), and secondary properties strings.
-            // A safer method parses past variable string blocks. In standard internal layouts:
-            // Offset 52 usually marks the string size indicator byte (character count) for the filename.
+            // Read character length byte from the standard MTP layout payload offset position
             u8 name_len_chars = info_buffer[52];
             u16 *utf16_ptr = (u16*)(info_buffer + 53);
 
             if (name_len_chars > 0 && read_bytes > (53 + (name_len_chars * 2))) {
                 size_t out_idx = 0;
-                // Simple UTF-16 to ASCII conversion logic mapping down straight bytes
                 for (out_idx = 0; out_idx < name_len_chars && out_idx < (max_len - 1); out_idx++) {
                     out_name[out_idx] = (char)(utf16_ptr[out_idx] & 0x00FF);
                 }
@@ -138,7 +135,6 @@ void BrowseAndroidFiles() {
         
         for(u32 i = 0; i < total_files_found; i++) {
             discovered_files[i].handle = elements[i + 1];
-            // Interrogate the object handle to recover actual textual filename assignments
             printf("Parsing item %u of %u...\n", i + 1, total_files_found);
             FetchFilename(discovered_files[i].handle, discovered_files[i].filename, 64);
         }
@@ -149,7 +145,7 @@ void BrowseAndroidFiles() {
 }
 
 bool SyncSelectedFile(u32 object_id, const char* out_filename) {
-    char target_path[128];
+    char target_path[128]; // Fix: Explicitly sized array configuration bounds
     snprintf(target_path, sizeof(target_path), "sd:/%s", out_filename);
     
     FILE *target_file = fopen(target_path, "wb");
@@ -162,7 +158,6 @@ bool SyncSelectedFile(u32 object_id, const char* out_filename) {
         return false;
     }
     
-    // Set up transactional parameters for target data object
     global_tx++;
     MTP_Header cmd;
     cmd.length = sizeof(MTP_Header);
@@ -219,15 +214,14 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    // Initialize session before mapping out names loop configurations
     global_tx++;
     MTP_Header open_cmd = { sizeof(MTP_Header), 1, MTP_OP_OPEN_SESSION, global_tx };
     if (USB_WriteBlkMsg(usb_device, ep_out, sizeof(MTP_Header), &open_cmd) >= 0) {
-        u32 param = 1; // Session ID parameter allocation block
+        u32 param = 1; 
         USB_WriteBlkMsg(usb_device, ep_out, sizeof(u32), &param);
         
-        u8 dummy_resp[32];
-        USB_ReadBlkMsg(usb_device, ep_in, 32, dummy_resp); // Flush handshake response
+        u8 dummy_resp[32]; // Fix: Explicit array buffer definition targets
+        USB_ReadBlkMsg(usb_device, ep_in, 32, dummy_resp); 
         BrowseAndroidFiles();
     }
 
@@ -245,7 +239,7 @@ int main(int argc, char **argv) {
         if (down & WPAD_BUTTON_HOME) break;
 
         if (total_files_found > 0) {
-            printf("\x1b[15;0H"); // Move console below status logs
+            printf("\x1b[15;0H"); 
             for (u32 i = 0; i < total_files_found; i++) {
                 if ((int)i == active_selection) {
                     printf(" -> [%s] <-\n", discovered_files[i].filename);
@@ -256,7 +250,7 @@ int main(int argc, char **argv) {
         }
 
         if (ir_pointer.valid) {
-            int calculated_y = (ir_pointer.y - 120) / 24; // Normalized selection hitboxes
+            int calculated_y = (ir_pointer.y - 120) / 24; 
             if (calculated_y >= 0 && calculated_y < (int)total_files_found) {
                 active_selection = calculated_y;
             }

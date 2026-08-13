@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 #include <gccore.h>
 #include <wiiuse/wpad.h>
 #include <fat.h>
@@ -11,6 +12,8 @@
 #define MTP_OP_GET_OBJECT_INFO      0x1008
 #define MTP_OP_GET_OBJECT           0x1009
 
+#define MAX_ITEMS_DISPLAYED         12
+
 // Alignment matching Wii hardware architecture constraints
 typedef struct {
     u32 length;
@@ -19,22 +22,18 @@ typedef struct {
     u32 transaction;
 } __attribute__((packed)) MTP_Header;
 
-// MTP Object Info Structure (Stripped to relevant metadata fields)
+// Cache structure to hold mapped files locally
 typedef struct {
-    u32 storage_id;
-    u16 format_code;
-    u16 protection;
-    u64 file_size;
-    // Followed by variable length strings for filename
-} __attribute__((packed)) MTP_ObjectInfo;
+    u32 handle;
+    char filename[64];
+} FileCacheEntry;
 
 static s32 usb_device = -1;
 static u8 ep_in = 0x81;
 static u8 ep_out = 0x02;
 static u32 global_tx = 1;
 
-// Global container to track files discovered on the Android phone
-static u32 phone_file_handles[256];
+static FileCacheEntry discovered_files[MAX_ITEMS_DISPLAYED];
 static u32 total_files_found = 0;
 
 void PrintUpdate(const char *msg) {
@@ -44,10 +43,12 @@ void PrintUpdate(const char *msg) {
 
 bool InitUSBAndFindAndroid() {
     u8 dev_count = 0;
-    usb_device_description dev_list;
+    usb_device_entry dev_list;
+    memset(dev_list, 0, sizeof(dev_list));
+
     USB_Initialize();
 
-    s32 ret = USB_GetDeviceList(dev_list, 8, USB_CLASS_PER_INTERFACE, &dev_count);
+    s32 ret = USB_GetDeviceList(dev_list, 8, 0, &dev_count);
     if (ret < 0 || dev_count == 0) return false;
 
     for (int i = 0; i < dev_count; i++) {
@@ -80,35 +81,73 @@ s32 TransactionMTP(u16 op_code, void* data_buf, u32 data_len, bool is_write) {
     return ret;
 }
 
-// Scans the phone filesystem and loads unique ID handles into an array
+// Interrogates a file handle to unpack its string metadata descriptor
+void FetchFilename(u32 handle, char* out_name, size_t max_len) {
+    u8 *info_buffer = memalign(32, 1024);
+    if (!info_buffer) return;
+    
+    memset(info_buffer, 0, 1024);
+    strncpy(out_name, "Unknown File Asset", max_len);
+
+    // Call MTP_OP_GET_OBJECT_INFO targeting our active unique handle ID
+    global_tx++; // Increment to map fresh out-of-loop parameter transaction blocks
+    MTP_Header cmd;
+    cmd.length = sizeof(MTP_Header);
+    cmd.type = 1; 
+    cmd.code = MTP_OP_GET_OBJECT_INFO;
+    cmd.transaction = global_tx;
+
+    if (USB_WriteBlkMsg(usb_device, ep_out, sizeof(MTP_Header), &cmd) >= 0) {
+        // Pass out additional handle targeted parameters explicitly
+        USB_WriteBlkMsg(usb_device, ep_out, sizeof(u32), &handle);
+        
+        s32 read_bytes = USB_ReadBlkMsg(usb_device, ep_in, 1024, info_buffer);
+        if (read_bytes > 64) {
+            // According to MTP standards:
+            // Filename resides after StorageID(4B), Format(2B), Protection(2B), Size(8B), and secondary properties strings.
+            // A safer method parses past variable string blocks. In standard internal layouts:
+            // Offset 52 usually marks the string size indicator byte (character count) for the filename.
+            u8 name_len_chars = info_buffer[52];
+            u16 *utf16_ptr = (u16*)(info_buffer + 53);
+
+            if (name_len_chars > 0 && read_bytes > (53 + (name_len_chars * 2))) {
+                size_t out_idx = 0;
+                // Simple UTF-16 to ASCII conversion logic mapping down straight bytes
+                for (out_idx = 0; out_idx < name_len_chars && out_idx < (max_len - 1); out_idx++) {
+                    out_name[out_idx] = (char)(utf16_ptr[out_idx] & 0x00FF);
+                }
+                out_name[out_idx] = '\0';
+            }
+        }
+    }
+    free(info_buffer);
+}
+
 void BrowseAndroidFiles() {
-    u8 *raw_buffer = iosAllocAligned(0, 4096, 32);
+    u8 *raw_buffer = memalign(32, 4096);
     if (!raw_buffer) return;
 
     PrintUpdate("Querying file structures from Android storage...");
-    
-    // Command 0x1007 requests an array of all storage elements
     s32 read_bytes = TransactionMTP(MTP_OP_GET_OBJECT_HANDLES, raw_buffer, 4096, false);
     
     if (read_bytes > 12) {
-        // Strip the 12-byte MTP container header to reach the array data
         u32 *elements = (u32*)(raw_buffer + 12);
-        u32 array_len = elements[0]; // First 4 bytes define total items
+        u32 array_len = elements[0]; 
         
-        total_files_found = (array_len > 15) ? 15 : array_len; // Limit to 15 items for display
+        total_files_found = (array_len > MAX_ITEMS_DISPLAYED) ? MAX_ITEMS_DISPLAYED : array_len; 
         
         for(u32 i = 0; i < total_files_found; i++) {
-            phone_file_handles[i] = elements[i + 1];
+            discovered_files[i].handle = elements[i + 1];
+            // Interrogate the object handle to recover actual textual filename assignments
+            printf("Parsing item %u of %u...\n", i + 1, total_files_found);
+            FetchFilename(discovered_files[i].handle, discovered_files[i].filename, 64);
         }
-        printf("Discovered %u items inside root partition.\n", array_len);
     } else {
         PrintUpdate("Failed parsing objects or partition is empty.");
     }
-    
-    iosFree(0, raw_buffer);
+    free(raw_buffer);
 }
 
-// Downloads selected elements directly to the SD card root mount path
 bool SyncSelectedFile(u32 object_id, const char* out_filename) {
     char target_path[128];
     snprintf(target_path, sizeof(target_path), "sd:/%s", out_filename);
@@ -117,10 +156,22 @@ bool SyncSelectedFile(u32 object_id, const char* out_filename) {
     if (!target_file) return false;
 
     u32 chunk_size = 64 * 1024;
-    u8 *io_buffer = iosAllocAligned(0, chunk_size, 32);
+    u8 *io_buffer = memalign(32, chunk_size);
+    if (!io_buffer) {
+        fclose(target_file);
+        return false;
+    }
     
-    // Request raw data stream for chosen file ID
-    TransactionMTP(MTP_OP_GET_OBJECT, NULL, 0, false); 
+    // Set up transactional parameters for target data object
+    global_tx++;
+    MTP_Header cmd;
+    cmd.length = sizeof(MTP_Header);
+    cmd.type = 1; 
+    cmd.code = MTP_OP_GET_OBJECT;
+    cmd.transaction = global_tx;
+
+    USB_WriteBlkMsg(usb_device, ep_out, sizeof(MTP_Header), &cmd);
+    USB_WriteBlkMsg(usb_device, ep_out, sizeof(u32), &object_id);
 
     s32 read_bytes = 0;
     u32 total_saved = 0;
@@ -128,7 +179,7 @@ bool SyncSelectedFile(u32 object_id, const char* out_filename) {
     while ((read_bytes = USB_ReadBlkMsg(usb_device, ep_in, chunk_size, io_buffer)) > 0) {
         u32 write_offset = 0;
         if (total_saved == 0 && read_bytes >= 12) {
-            write_offset = 12; // Drop initial MTP sequence wrapper
+            write_offset = 12; 
             read_bytes -= 12;
         }
         if (read_bytes > 0) {
@@ -137,27 +188,28 @@ bool SyncSelectedFile(u32 object_id, const char* out_filename) {
         }
     }
 
-    iosFree(0, io_buffer);
+    free(io_buffer);
     fclose(target_file);
     return true;
 }
 
 int main(int argc, char **argv) {
-    // Basic video system configuration
     void *frame_buffer;
-    GXM_Init(); 
     VIDEO_Init();
     
-    // Configure Wiimote pointer tracking
     WPAD_Init();
     WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
     WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
 
-    frame_buffer = SYS_AllocateFramebuffer(VIDEO_GetPreferredMode(NULL));
-    VIDEO_Configure(VIDEO_GetPreferredMode(NULL));
+    GXRModeObj *rmode = VIDEO_GetPreferredMode(NULL);
+    frame_buffer = SYS_AllocateFramebuffer(rmode);
+    
+    VIDEO_Configure(rmode);
     VIDEO_SetNextFramebuffer(frame_buffer);
     VIDEO_SetBlack(false);
     VIDEO_Flush();
+    
+    console_init(frame_buffer, 20, 20, rmode->fbWidth, rmode->xfbHeight, rmode->fbWidth * VI_DISPLAY_PIX_SZ);
 
     if (!fatInitDefault()) return 0;
 
@@ -167,7 +219,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (TransactionMTP(MTP_OP_OPEN_SESSION, NULL, 0, false) >= 0) {
+    // Initialize session before mapping out names loop configurations
+    global_tx++;
+    MTP_Header open_cmd = { sizeof(MTP_Header), 1, MTP_OP_OPEN_SESSION, global_tx };
+    if (USB_WriteBlkMsg(usb_device, ep_out, sizeof(MTP_Header), &open_cmd) >= 0) {
+        u32 param = 1; // Session ID parameter allocation block
+        USB_WriteBlkMsg(usb_device, ep_out, sizeof(u32), &param);
+        
+        u8 dummy_resp[32];
+        USB_ReadBlkMsg(usb_device, ep_in, 32, dummy_resp); // Flush handshake response
         BrowseAndroidFiles();
     }
 
@@ -175,49 +235,41 @@ int main(int argc, char **argv) {
 
     int active_selection = 0;
 
-    // Core Interaction Engine Loop
     while (1) {
         WPAD_ScanPads();
         u32 down = WPAD_ButtonsDown(0);
         
-        // Read Infrared bounding coords mapping directly from sensor bar
         ir_t ir_pointer;
         WPAD_IR(WPAD_CHAN_0, &ir_pointer);
 
         if (down & WPAD_BUTTON_HOME) break;
 
-        // Render simple user menu interface on the screen console grid
         if (total_files_found > 0) {
-            printf("\x1b[10;0H"); // Lock terminal cursor position
+            printf("\x1b[15;0H"); // Move console below status logs
             for (u32 i = 0; i < total_files_found; i++) {
                 if ((int)i == active_selection) {
-                    printf(" -> [MTP File Object ID: 0x%08X] <-\n", phone_file_handles[i]);
+                    printf(" -> [%s] <-\n", discovered_files[i].filename);
                 } else {
-                    printf("    [MTP File Object ID: 0x%08X]\n", phone_file_handles[i]);
+                    printf("    [%s]\n", discovered_files[i].filename);
                 }
             }
         }
 
-        // Translate Wiimote structural positioning across menu options
         if (ir_pointer.valid) {
-            int calculated_y = ir_pointer.y / 32; // Scale height mapping matrix
+            int calculated_y = (ir_pointer.y - 120) / 24; // Normalized selection hitboxes
             if (calculated_y >= 0 && calculated_y < (int)total_files_found) {
                 active_selection = calculated_y;
             }
-            // Optional visual feedback cursor token tracking positioning markers
-            printf("\x1b[25;0HCursor Position Vector: X:%3d Y:%3d", (int)ir_pointer.x, (int)ir_pointer.y);
+            printf("\x1b[28;0HCursor Position Vector: X:%3d Y:%3d", (int)ir_pointer.x, (int)ir_pointer.y);
         }
 
-        // Execute download operation block if user confirms option selection
-        if (down & WPAD_BUTTON_A && total_files_found > 0) {
-            printf("\nInitializing background sync loop for target ID...\n");
-            char out_name[32];
-            snprintf(out_name, sizeof(out_name), "mtp_sync_%04x.bin", active_selection);
+        if ((down & WPAD_BUTTON_A) && total_files_found > 0) {
+            printf("\nSyncing: %s...\n", discovered_files[active_selection].filename);
             
-            if (SyncSelectedFile(phone_file_handles[active_selection], out_name)) {
-                printf("Success! Saved file onto SD root partition path.\n");
+            if (SyncSelectedFile(discovered_files[active_selection].handle, discovered_files[active_selection].filename)) {
+                printf("Success! Saved onto SD card.\n");
             } else {
-                printf("Error writing to storage card media array targets.\n");
+                printf("Error writing targeted elements to media storage.\n");
             }
         }
 

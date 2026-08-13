@@ -10,14 +10,14 @@ TARGET   := wii_mtp_client
 SOURCES  := source
 INCLUDES := 
 
-# Fix: Dynamically track and link correct include directory structures
+# Track and link include directory structures
 INCLUDE  := -I$(DEVKITPRO)/libogc/include $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir))
 
-# Compilation architectures flags configurations targeting the PowerPC chip
+# Compilation architecture flags targeting the PowerPC chip
 CFLAGS   := -g -O2 -mrvl -Wall $(MACHDEP) $(INCLUDE)
 LDFLAGS  := -g $(MACHDEP) -mrvl -L$(DEVKITPRO)/libogc/lib/wii
 
-# Link explicit system subsystems dependencies modules sequentially 
+# Link explicit system subsystem dependencies modules sequentially 
 LIBS     := -lfat -lwiiuse -lbte -logc -lm
 
 CFILES   := $(foreach dir,$(SOURCES),$(wildcard $(dir)/*.c))
@@ -26,9 +26,10 @@ OBJS     := $(CFILES:.c=.o)
 all: $(TARGET).dol
 
 $(TARGET).dol: $(TARGET).elf
+	$(ELF2DOL) $< $@
+
 $(TARGET).elf: $(OBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
-	$(ELF2DOL) $@ $(TARGET).dol
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
